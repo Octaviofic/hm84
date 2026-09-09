@@ -8,6 +8,7 @@ const API_BASE = process.env.STRAVA_API_BASE || 'https://www.strava.com/api/v3';
 const PUBLIC_URL = (process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-only-change-me';
 const CACHE_MS = 4 * 60 * 1000;
+const BACKGROUND_SYNC_MS = 5 * 60 * 1000;
 
 app.use(express.json());
 app.use(express.static('public', { maxAge: 0 }));
@@ -106,6 +107,17 @@ async function statsFor(session, force = false) {
   return result;
 }
 
+async function runBackgroundSync() {
+  if (!serverSession) return;
+  try {
+    serverSession = await refreshSessionObject(serverSession);
+    const [acts, stats] = await Promise.all([activitiesFor(serverSession, true), statsFor(serverSession, true)]);
+    console.log('Background sync', acts.data.length, 'activities', 'stats', !!stats);
+  } catch (e) {
+    console.error('Background sync error', e.message);
+  }
+}
+
 app.get('/auth/strava', (req, res) => {
   if (!process.env.STRAVA_CLIENT_ID || !process.env.STRAVA_CLIENT_SECRET) return res.status(503).send('Strava ainda não configurado no servidor.');
   const state = crypto.randomBytes(18).toString('hex');
@@ -135,6 +147,7 @@ app.get('/auth/strava/callback', async (req, res) => {
     setSession(res, serverSession);
     activityCache.delete(String(t.athlete?.id || 'me'));
     statsCache.delete(String(t.athlete?.id || ''));
+    setImmediate(runBackgroundSync);
     res.redirect('/?strava=connected');
   } catch (e) {
     console.error('OAuth callback error', e.message);
@@ -183,8 +196,9 @@ app.post('/api/sync', async (req, res) => {
   try {
     const s = await freshSession(req, res);
     if (!s) return res.status(401).json({ error: 'Strava not connected' });
-    const [acts, stats] = await Promise.all([activitiesFor(s, true), statsFor(s, true)]);
-    res.json({ ok: true, count: acts.data.length, syncedAt: new Date(acts.at).toISOString(), stats: stats?.data || null });
+    await runBackgroundSync();
+    const cached = activityCache.get(String(s.athlete?.id || 'me'));
+    res.json({ ok: true, count: cached?.data?.length || 0, syncedAt: cached ? new Date(cached.at).toISOString() : null });
   } catch (e) {
     console.error('Manual sync error', e.message);
     res.status(500).json({ error: e.message });
@@ -192,17 +206,11 @@ app.post('/api/sync', async (req, res) => {
 });
 
 app.post('/internal/sync', async (req, res) => {
-  try {
-    if (!process.env.INTERNAL_SYNC_SECRET || req.get('x-sync-secret') !== process.env.INTERNAL_SYNC_SECRET) return res.sendStatus(403);
-    if (!serverSession) return res.status(409).json({ ok: false, reason: 'No active Strava session yet' });
-    serverSession = await refreshSessionObject(serverSession);
-    const [acts, stats] = await Promise.all([activitiesFor(serverSession, true), statsFor(serverSession, true)]);
-    console.log('Background sync', acts.data.length, 'activities');
-    res.json({ ok: true, count: acts.data.length, syncedAt: new Date(acts.at).toISOString(), stats: !!stats });
-  } catch (e) {
-    console.error('Background sync error', e.message);
-    res.status(500).json({ ok: false, error: e.message });
-  }
+  if (!process.env.INTERNAL_SYNC_SECRET || req.get('x-sync-secret') !== process.env.INTERNAL_SYNC_SECRET) return res.sendStatus(403);
+  if (!serverSession) return res.status(409).json({ ok: false, reason: 'No active Strava session yet' });
+  await runBackgroundSync();
+  const cached = activityCache.get(String(serverSession.athlete?.id || 'me'));
+  res.json({ ok: true, count: cached?.data?.length || 0, syncedAt: cached ? new Date(cached.at).toISOString() : null });
 });
 
 app.post('/api/disconnect', (req, res) => {
@@ -220,7 +228,9 @@ app.get('/health', (req, res) => res.json({
   ok: true,
   stravaConfigured: !!(process.env.STRAVA_CLIENT_ID && process.env.STRAVA_CLIENT_SECRET),
   cacheMinutes: CACHE_MS / 60000,
-  backgroundReady: !!serverSession
+  backgroundReady: !!serverSession,
+  backgroundSyncMinutes: BACKGROUND_SYNC_MS / 60000
 }));
 
+setInterval(runBackgroundSync, BACKGROUND_SYNC_MS).unref();
 app.listen(PORT, '0.0.0.0', () => console.log(`HM84 ${PUBLIC_URL}`));
