@@ -14,6 +14,7 @@ app.use(express.static('public', { maxAge: 0 }));
 
 const activityCache = new Map();
 const statsCache = new Map();
+let serverSession = null;
 
 function cookies(req) {
   const out = {};
@@ -56,8 +57,7 @@ async function tokenRequest(body) {
   return r.json();
 }
 
-async function freshSession(req, res) {
-  let s = getSession(req);
+async function refreshSessionObject(s) {
   if (!s) return null;
   if (Number(s.expires_at) > Math.floor(Date.now() / 1000) + 300) return s;
   const t = await tokenRequest({
@@ -66,8 +66,16 @@ async function freshSession(req, res) {
     grant_type: 'refresh_token',
     refresh_token: s.refresh_token
   });
-  s = { ...s, access_token: t.access_token, refresh_token: t.refresh_token, expires_at: t.expires_at };
-  setSession(res, s);
+  return { ...s, access_token: t.access_token, refresh_token: t.refresh_token, expires_at: t.expires_at };
+}
+
+async function freshSession(req, res) {
+  let s = getSession(req);
+  if (!s) return null;
+  const before = s.expires_at;
+  s = await refreshSessionObject(s);
+  if (s.expires_at !== before) setSession(res, s);
+  serverSession = s;
   return s;
 }
 
@@ -123,7 +131,8 @@ app.get('/auth/strava/callback', async (req, res) => {
       code: req.query.code,
       grant_type: 'authorization_code'
     });
-    setSession(res, { access_token: t.access_token, refresh_token: t.refresh_token, expires_at: t.expires_at, athlete: t.athlete });
+    serverSession = { access_token: t.access_token, refresh_token: t.refresh_token, expires_at: t.expires_at, athlete: t.athlete };
+    setSession(res, serverSession);
     activityCache.delete(String(t.athlete?.id || 'me'));
     statsCache.delete(String(t.athlete?.id || ''));
     res.redirect('/?strava=connected');
@@ -135,11 +144,13 @@ app.get('/auth/strava/callback', async (req, res) => {
 
 app.get('/api/status', (req, res) => {
   const s = getSession(req);
+  if (s) serverSession = s;
   res.json({
     configured: !!(process.env.STRAVA_CLIENT_ID && process.env.STRAVA_CLIENT_SECRET),
     connected: !!s,
     athlete: s?.athlete || null,
-    autoRefreshMinutes: 5
+    autoRefreshMinutes: 5,
+    backgroundReady: !!serverSession
   });
 });
 
@@ -180,12 +191,27 @@ app.post('/api/sync', async (req, res) => {
   }
 });
 
+app.post('/internal/sync', async (req, res) => {
+  try {
+    if (!process.env.INTERNAL_SYNC_SECRET || req.get('x-sync-secret') !== process.env.INTERNAL_SYNC_SECRET) return res.sendStatus(403);
+    if (!serverSession) return res.status(409).json({ ok: false, reason: 'No active Strava session yet' });
+    serverSession = await refreshSessionObject(serverSession);
+    const [acts, stats] = await Promise.all([activitiesFor(serverSession, true), statsFor(serverSession, true)]);
+    console.log('Background sync', acts.data.length, 'activities');
+    res.json({ ok: true, count: acts.data.length, syncedAt: new Date(acts.at).toISOString(), stats: !!stats });
+  } catch (e) {
+    console.error('Background sync error', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.post('/api/disconnect', (req, res) => {
   const s = getSession(req);
   if (s?.athlete?.id) {
     activityCache.delete(String(s.athlete.id));
     statsCache.delete(String(s.athlete.id));
   }
+  serverSession = null;
   res.setHeader('Set-Cookie', 'hm84_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0');
   res.json({ ok: true });
 });
@@ -193,7 +219,8 @@ app.post('/api/disconnect', (req, res) => {
 app.get('/health', (req, res) => res.json({
   ok: true,
   stravaConfigured: !!(process.env.STRAVA_CLIENT_ID && process.env.STRAVA_CLIENT_SECRET),
-  cacheMinutes: CACHE_MS / 60000
+  cacheMinutes: CACHE_MS / 60000,
+  backgroundReady: !!serverSession
 }));
 
 app.listen(PORT, '0.0.0.0', () => console.log(`HM84 ${PUBLIC_URL}`));
