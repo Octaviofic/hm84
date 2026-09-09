@@ -8,12 +8,13 @@ const app=express();
 const PORT=process.env.PORT||3000;
 const API_BASE=process.env.STRAVA_API_BASE||'https://www.strava.com/api/v3';
 const publicUrl=()=> (process.env.RENDER_EXTERNAL_URL||process.env.PUBLIC_URL||`http://localhost:${PORT}`).replace(/\/$/,'');
-const pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_URL?.includes('localhost')?false:{rejectUnauthorized:false}});
+const pool=process.env.DATABASE_URL ? new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_URL.includes('localhost')?false:{rejectUnauthorized:false}}) : null;
 
 app.use(express.json());
 app.use(express.static('public'));
 
 async function initDb(){
+ if(!pool) return;
  await pool.query(`
  CREATE TABLE IF NOT EXISTS strava_auth(
  athlete_id BIGINT PRIMARY KEY,access_token TEXT NOT NULL,refresh_token TEXT NOT NULL,
@@ -43,12 +44,14 @@ async function tokenRequest(body){
 }
 
 async function authRow(id=null){
+ if(!pool) return null;
  const q=id?await pool.query('SELECT * FROM strava_auth WHERE athlete_id=$1 LIMIT 1',[id])
            :await pool.query('SELECT * FROM strava_auth ORDER BY updated_at DESC LIMIT 1');
  return q.rows[0]||null;
 }
 
 async function saveAuth(t){
+ if(!pool) throw new Error('Banco de dados ainda não configurado');
  const a=t.athlete||{};
  await pool.query(`INSERT INTO strava_auth(athlete_id,access_token,refresh_token,expires_at,scope,athlete,updated_at)
  VALUES($1,$2,$3,$4,$5,$6,NOW())
@@ -75,6 +78,7 @@ async function sget(path,id=null){
 }
 
 async function upsert(a){
+ if(!pool) throw new Error('Banco de dados ainda não configurado');
  await pool.query(`INSERT INTO activities(id,athlete_id,name,sport_type,start_date,distance,moving_time,elapsed_time,
  total_elevation_gain,average_speed,max_speed,average_heartrate,max_heartrate,average_cadence,suffer_score,raw,updated_at)
  VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,NOW())
@@ -106,7 +110,7 @@ async function ensureWebhook(){
 }
 
 app.get('/auth/strava',(req,res)=>{
- if(!process.env.STRAVA_CLIENT_ID) return res.status(503).send('Integração Strava ainda não configurada.');
+ if(!process.env.STRAVA_CLIENT_ID || !pool) return res.status(503).send('Integração Strava ainda não configurada.');
  const state=crypto.randomBytes(18).toString('hex');
  res.setHeader('Set-Cookie',`hm84_oauth_state=${state}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=600`);
  const p=new URLSearchParams({client_id:process.env.STRAVA_CLIENT_ID,response_type:'code',
@@ -124,8 +128,9 @@ app.get('/auth/strava/callback',async(req,res)=>{
  }catch(e){console.error(e);res.status(500).send('Strava connection failed: '+e.message)}
 });
 
-app.get('/api/status',async(req,res)=>{const r=await authRow();res.json({connected:!!r,configured:!!process.env.STRAVA_CLIENT_ID,athlete:r?.athlete||null})});
+app.get('/api/status',async(req,res)=>{const r=await authRow();res.json({connected:!!r,configured:!!process.env.STRAVA_CLIENT_ID&&!!pool,database:!!pool,athlete:r?.athlete||null})});
 app.get('/api/activities',async(req,res)=>{
+ if(!pool) return res.json([]);
  const {rows}=await pool.query(`SELECT id,name,sport_type,start_date,distance,moving_time,elapsed_time,total_elevation_gain,
  average_speed,max_speed,average_heartrate,max_heartrate,average_cadence,suffer_score FROM activities ORDER BY start_date DESC LIMIT 100`);
  res.json(rows);
@@ -142,12 +147,12 @@ app.post('/webhook',(req,res)=>{
  const ev=req.body; res.sendStatus(200);
  setImmediate(async()=>{try{
   if(ev.object_type==='activity'){
-   if(ev.aspect_type==='delete') await pool.query('DELETE FROM activities WHERE id=$1',[ev.object_id]);
+   if(ev.aspect_type==='delete' && pool) await pool.query('DELETE FROM activities WHERE id=$1',[ev.object_id]);
    else if(await authRow(ev.owner_id)) await upsert(await sget(`/activities/${ev.object_id}`,ev.owner_id));
-  }else if(ev.object_type==='athlete'&&ev.updates?.authorized==='false')
+  }else if(ev.object_type==='athlete'&&ev.updates?.authorized==='false' && pool)
    await pool.query('DELETE FROM strava_auth WHERE athlete_id=$1',[ev.owner_id]);
  }catch(e){console.error('webhook',e)}});
 });
-app.get('/health',(req,res)=>res.json({ok:true}));
+app.get('/health',(req,res)=>res.json({ok:true,database:!!pool}));
 
 initDb().then(()=>app.listen(PORT,'0.0.0.0',()=>console.log('HM84 '+publicUrl()))).catch(e=>{console.error(e);process.exit(1)});
